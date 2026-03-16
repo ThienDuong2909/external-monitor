@@ -1,0 +1,16 @@
+# External Uptime Monitor
+
+External site monitoring using GitHub Actions + Telegram Bot.
+
+Checks site health every 5 minutes from GitHub servers. Alerts via Telegram when site goes DOWN or recovers.
+
+## Setup
+
+See [README.md](README.md) for full setup instructions.
+
+## Structure
+
+```
+.github/workflows/uptime-check.yml   # GitHub Actions workflow
+README.md                            # Setup guide (Vietnamese)
+```

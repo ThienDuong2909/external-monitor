@@ -1,0 +1,160 @@
+name: Uptime Monitor
+
+on:
+  schedule:
+    # Chạy mỗi 5 phút
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    # Cho phép chạy thủ công để test
+
+jobs:
+  check-uptime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Khôi phục trạng thái lần check trước (tránh spam)
+      - name: Restore previous state
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .monitor-state
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: monitor-state-
+
+      - name: Check sites and alert
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Tạo file state nếu chưa có
+          mkdir -p .monitor-state
+          STATE_FILE=".monitor-state/status.txt"
+          touch "$STATE_FILE"
+
+          # Danh sách URL cần monitor
+          URLS=(
+            "API|https://api.blog.thienduong.info/api/health"
+            "Grafana|https://grafana.thienduong.info/api/health"
+          )
+
+          TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
+          HAS_CHANGE=false
+
+          for ENTRY in "${URLS[@]}"; do
+            NAME="${ENTRY%%|*}"
+            URL="${ENTRY##*|}"
+
+            # Check HTTP status
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$URL" 2>/dev/null || echo "000")
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+              CURRENT_STATUS="UP"
+            else
+              CURRENT_STATUS="DOWN"
+            fi
+
+            # Đọc trạng thái trước đó
+            PREV_STATUS=$(grep "^${NAME}=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || echo "UNKNOWN")
+
+            echo "$NAME: HTTP=$HTTP_CODE, Status=$CURRENT_STATUS, Previous=$PREV_STATUS"
+
+            # Chỉ gửi Telegram khi TRẠNG THÁI THAY ĐỔI (tránh spam)
+            if [ "$CURRENT_STATUS" != "$PREV_STATUS" ]; then
+              HAS_CHANGE=true
+
+              if [ "$CURRENT_STATUS" = "DOWN" ]; then
+                # === SITE DOWN ===
+                TEXT="🔴 <b>SITE DOWN</b>
+
+<b>Service:</b> ${NAME}
+<b>URL:</b> <code>${URL}</code>
+<b>HTTP Status:</b> ${HTTP_CODE}
+<b>Time:</b> ${TIMESTAMP}
+
+⚠️ VPS hoặc service có thể đã chết!
+Kiểm tra: ssh root@103.110.85.87"
+
+                echo "🔴 SENDING DOWN ALERT: $NAME"
+              else
+                # === SITE RECOVERED ===
+
+                # Tính thời gian down
+                DOWN_SINCE=$(grep "^${NAME}_DOWN_AT=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || echo "unknown")
+
+                TEXT="✅ <b>SITE RECOVERED</b>
+
+<b>Service:</b> ${NAME}
+<b>URL:</b> <code>${URL}</code>
+<b>HTTP Status:</b> ${HTTP_CODE}
+<b>Time:</b> ${TIMESTAMP}
+<b>Was down since:</b> ${DOWN_SINCE}
+
+Hệ thống đã hoạt động trở lại!"
+
+                echo "✅ SENDING RECOVERY ALERT: $NAME"
+              fi
+
+              # Gửi Telegram
+              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${CHAT_ID}" \
+                -d "text=${TEXT}" \
+                -d "parse_mode=HTML" > /dev/null
+            fi
+
+            # Lưu trạng thái hiện tại
+            # Xóa dòng cũ và thêm dòng mới
+            grep -v "^${NAME}=" "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+            echo "${NAME}=${CURRENT_STATUS}" >> "${STATE_FILE}.tmp"
+
+            # Lưu thời điểm DOWN
+            grep -v "^${NAME}_DOWN_AT=" "${STATE_FILE}.tmp" > "${STATE_FILE}.tmp2" 2>/dev/null || true
+            if [ "$CURRENT_STATUS" = "DOWN" ] && [ "$PREV_STATUS" != "DOWN" ]; then
+              echo "${NAME}_DOWN_AT=${TIMESTAMP}" >> "${STATE_FILE}.tmp2"
+            elif [ "$CURRENT_STATUS" = "DOWN" ]; then
+              # Giữ thời điểm down cũ
+              grep "^${NAME}_DOWN_AT=" "$STATE_FILE" >> "${STATE_FILE}.tmp2" 2>/dev/null || true
+            fi
+            mv "${STATE_FILE}.tmp2" "$STATE_FILE"
+          done
+
+          echo ""
+          echo "=== Current State ==="
+          cat "$STATE_FILE"
+
+      # Gửi nhắc nhở mỗi 30 phút nếu vẫn DOWN
+      - name: Send reminder if still DOWN
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATE_FILE=".monitor-state/status.txt"
+          MINUTE=$(date -u +'%M')
+
+          # Chỉ nhắc ở phút 0 và 30 (tránh spam mỗi 5 phút)
+          if [ "$MINUTE" = "00" ] || [ "$MINUTE" = "30" ]; then
+            DOWN_SERVICES=""
+            while IFS='=' read -r KEY VALUE; do
+              if [[ ! "$KEY" =~ _DOWN_AT$ ]] && [ "$VALUE" = "DOWN" ]; then
+                DOWN_SERVICES="${DOWN_SERVICES}• ${KEY}\n"
+              fi
+            done < "$STATE_FILE"
+
+            if [ -n "$DOWN_SERVICES" ]; then
+              TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
+              TEXT="⚠️ <b>NHẮC NHỞ — Vẫn đang DOWN</b>
+
+${DOWN_SERVICES}
+<b>Time:</b> ${TIMESTAMP}
+
+Hệ thống chưa phục hồi!"
+
+              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${CHAT_ID}" \
+                -d "text=${TEXT}" \
+                -d "parse_mode=HTML" > /dev/null
+
+              echo "⚠️ Reminder sent for DOWN services"
+            fi
+          fi
